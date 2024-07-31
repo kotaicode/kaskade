@@ -26,6 +26,7 @@ python = ">=3.10 <3.13"
 cloup = "^3.0"
 textual =  "^0.72"
 confluent-kafka = {extras = ["avro", "json", "protobuf"], version = "^2.5"}
+aws-msk-iam-sasl-signer-python = "^1.0.1"
 
 [tool.poetry.dev-dependencies]
 black = "*"
