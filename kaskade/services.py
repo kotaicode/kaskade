@@ -1,3 +1,5 @@
+import socket
+import time
 import uuid
 from datetime import datetime
 from typing import Any
@@ -17,6 +19,8 @@ from confluent_kafka.admin import (
 )
 from confluent_kafka.cimpl import NewTopic, NewPartitions
 
+from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
+
 from kaskade import logger
 from kaskade.configs import MILLISECONDS_24H
 from kaskade.models import (
@@ -33,6 +37,13 @@ from kaskade.models import (
 from kaskade.deserializers import Format, DeserializerPool
 from kaskade.utils import make_it_async
 
+def oauth_cb(oauth_config):
+    print("oauth_cb in consumerservice")
+    auth_token, expiry_ms = MSKAuthTokenProvider.generate_auth_token("eu-central-1", aws_debug_creds = True)
+    # Note that this library expects oauth_cb to return expiry time in seconds since epoch, while the token generator returns expiry in ms
+    print(auth_token)
+    return auth_token, expiry_ms/1000
+
 
 class ConsumerService:
     def __init__(
@@ -45,7 +56,7 @@ class ConsumerService:
         *,
         page_size: int = 25,
         poll_retries: int = 5,
-        timeout: float = 0.5,
+        timeout: float = 10,
         stabilization_retries: int = 30,
     ) -> None:
         self.topic = topic
@@ -64,8 +75,24 @@ class ConsumerService:
                 "max.poll.interval.ms": MILLISECONDS_24H,
                 "logger": logger,
             }
+            | {
+                "security.protocol": "SASL_SSL",
+                "sasl.mechanism": "OAUTHBEARER",
+                "oauth_cb": oauth_cb,
+            }
         )
+        # TODO only add the oauth config when using oauth
+        # TODO replace 3 with a constant for timeouts/maybe configurable
+        # TODO only do this when using oauth
+        print("DEBUG: created ConsumerService... polling and sleeping")
+        self.consumer.poll(3)
+        time.sleep(3)
+        print("DEBUG: done polling and sleeping")
+
         self.consumer.subscribe([topic], on_assign=self.on_assign)
+
+        # TODO remove this, hardcoded for testing
+        self.stable = True
         self.deserializer_factory = deserializer_factory
 
     def on_assign(self, consumer: Consumer, partitions: list[TopicPartition]) -> None:
@@ -89,24 +116,29 @@ class ConsumerService:
 
         while len(records) < self.page_size:
             if poll_retries >= self.poll_retries:
+                print("DEBUG: poll_retries exceeded")
                 break
 
             if stabilization_retries >= self.stabilization_retries:
+                print("DEBUG: stabilization_retries exceeded")
                 break
 
             record_metadata = await make_it_async(self.consumer.poll, self.timeout)
 
             if not self.stable:
+                print("DEBUG: not stable")
                 stabilization_retries += 1
                 continue
             stabilization_retries = 0
 
             if record_metadata is None:
+                print("DEBUG: record_metadata is None")
                 poll_retries += 1
                 continue
             poll_retries = 0
 
             if record_metadata.error():
+                print("DEBUG: record_metadata error")
                 raise KafkaException(record_metadata.error())
 
             timestamp_available, timestamp = record_metadata.timestamp()
@@ -166,9 +198,21 @@ class ConsumerService:
 
 
 class ClusterService:
-    def __init__(self, config: dict[str, str], *, timeout: float = 2.0) -> None:
+    def __init__(self, config: dict[str, str], *, timeout: float = 15) -> None:
         self.timeout = timeout
-        self.admin_client = AdminClient(config | {"logger": logger})
+        # TODO only add the oauth config when using oauth
+        self.admin_client = AdminClient(config | {"logger": logger} | {
+                "security.protocol": "SASL_SSL",
+                "sasl.mechanism": "OAUTHBEARER",
+                "oauth_cb": oauth_cb,
+                "client.id": socket.gethostname(),
+            })
+        # TODO replace 3 with a constant for timeouts/maybe configurable
+        # TODO only do this when using oauth
+        print("DEBUG: created Adminclient ClusterService... polling and sleeping")
+        self.admin_client.poll(3)
+        time.sleep(3)
+        print("DEBUG: done polling and sleeping")
 
     def get(self) -> Cluster:
         cluster_metadata: DescribeClusterResult = self.admin_client.describe_cluster(
@@ -200,11 +244,23 @@ class ClusterService:
 
 
 class TopicService:
-    def __init__(self, config: dict[str, str], *, timeout: float = 2.0) -> None:
+    def __init__(self, config: dict[str, str], *, timeout: float = 15.0) -> None:
         self.timeout = timeout
-        self.config = config.copy() | {"logger": logger}
+        # TODO only add the oauth config when using oauth
+        self.config = config.copy() | {"logger": logger} | {
+                "security.protocol": "SASL_SSL",
+                "sasl.mechanism": "OAUTHBEARER",
+                "oauth_cb": oauth_cb,
+                "client.id": socket.gethostname(),
+            }
         self.admin_client = AdminClient(self.config)
-
+        # TODO replace 3 with a constant for timeouts/maybe configurable
+        # TODO only do this when using oauth
+        print("DEBUG: created admin client in TopicService ... polling and sleeping")
+        self.admin_client.poll(3)
+        time.sleep(3)
+        print("DEBUG: done polling and sleeping")
+    
     def create(self, new_topics: list[NewTopic]) -> None:
         futures = self.admin_client.create_topics(new_topics)
         for future in futures.values():
@@ -248,6 +304,8 @@ class TopicService:
             future.result()
 
     async def all(self) -> dict[str, Topic]:
+        self.admin_client.poll(3)
+        time.sleep(3)
         topics = await self._map_topics(self._list_topics_metadata())
         await self._map_groups_into_topics(self._list_groups_metadata(), topics)
         return topics
@@ -256,7 +314,18 @@ class TopicService:
         self, groups_metadata: list[ConsumerGroupDescription], topics: dict[str, Topic]
     ) -> None:
         for group_metadata in groups_metadata:
-            group_consumer = Consumer(self.config | {"group.id": group_metadata.group_id})
+            # TODO
+            group_consumer = Consumer(self.config | {"group.id": group_metadata.group_id} | {
+                "security.protocol": "SASL_SSL",
+                "sasl.mechanism": "OAUTHBEARER",
+                "oauth_cb": oauth_cb,
+                "group.id": socket.gethostname(),
+            })
+            print("DEBUG:: created group consumer, polling and sleeping")
+            group_consumer.poll(3)
+            time.sleep(3)
+            print("DEBUG:: done polling and sleeping")
+
             for topic in topics.values():
 
                 coordinator = Node(
@@ -363,7 +432,15 @@ class TopicService:
     ) -> tuple[int, int]:
         low, high = 0, 0
 
-        consumer = Consumer(self.config | {"group.id": f"kaskade-{uuid.uuid4()}"})
+        consumer = Consumer(self.config | {"group.id": f"kaskade-{uuid.uuid4()}"} | {
+                "security.protocol": "SASL_SSL",
+                "sasl.mechanism": "OAUTHBEARER",
+                "oauth_cb": oauth_cb,
+            })
+        print("DEBUG:: created consumer in _get_watermarks, polling and sleeping")
+        consumer.poll(3)
+        time.sleep(3)
+        print("DEBUG:: done polling and sleeping")
 
         try:
             low, high = await make_it_async(
@@ -398,6 +475,10 @@ class TopicService:
     def _list_topics_metadata(self) -> list[TopicMetadata]:
         def sort_by_topic_name(topic: TopicMetadata) -> Any:
             return topic.topic.lower()
+        print("DEBUG: polling in _list_topics_metadata....")
+        self.admin_client.poll(3)
+        time.sleep(3)
+        print("DEBUG: done polling in _list_topics_metadata....")
 
         return sorted(
             list(self.admin_client.list_topics(timeout=self.timeout).topics.values()),
